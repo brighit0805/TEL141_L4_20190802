@@ -1,18 +1,19 @@
 #!/bin/bash
-# Uso: ./init_master.sh <interfaz1> [interfaz2 ...]
+# Uso: ./init_master.sh "ens4 ens3"
+IFACES=$1
 
-IFACES="$@"
+# 1. Crear OVS 'br-int' si no existe
+if ! sudo ovs-vsctl br-exists br-int; then
+    sudo ovs-vsctl add-br br-int
+fi
 
-# 1. Crear OVS local 'br-int' si no existe
-sudo ovs-vsctl --may-exist add-br br-int
-
-# 2. Conectar interfaces provistas al OVS 'br-int'
+# 2. Conectar interfaces al OVS
 for iface in $IFACES; do
-    sudo ovs-vsctl --may-exist add-port br-int $iface
+    if ! sudo ovs-vsctl list-ports br-int | grep -q "^${iface}$"; then
+        sudo ovs-vsctl add-port br-int $iface
+    fi
+    sudo ip link set $iface up
 done
 
 # 3. Activar IPv4 forwarding
-sudo sysctl -w net.ipv4.ip_forward=1
-
-# 4. Modificar acción por defecto de FORWARD a DROP
-sudo iptables -P FORWARD DROP
+sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null

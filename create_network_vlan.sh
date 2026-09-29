@@ -1,47 +1,48 @@
 #!/bin/bash
-# Uso: ./create_network_vlan.sh <VLAN_ID> <CIDR> <DHCP_ENABLED 1|0> [DHCP_START] [DHCP_END]
-
+# Uso: ./create_network_vlan.sh <VLAN_ID> <CIDR> <habilitado|deshabilitado> [RANGO_DHCP]
 VLAN_ID=$1
 CIDR=$2
-DHCP_ENABLE=$3
-DHCP_START=$4
-DHCP_END=$5
+DHCP_OPTION=$3
+DHCP_RANGE=$4
 
-# Obtener la primera IP util para usarla como Gateway
-GW_IP=$(echo $CIDR | cut -d'/' -f1 | awk -F. '{print $1"."$2"."$3"."$4+1}')
-PREFIX=$(echo $CIDR | cut -d'/' -f2)
+# 1. Modificar FORWARD de ACCEPT a DROP
+sudo iptables -P FORWARD DROP
 
-# 1. Crear interfaz interna en OVS con el VLAN ID
-INT_NAME="gw_vlan${VLAN_ID}"
-sudo ovs-vsctl --may-exist add-port br-int $INT_NAME -- set Interface $INT_NAME type=internal tag=$VLAN_ID
-sudo ip addr flush dev $INT_NAME
-sudo ip addr add ${GW_IP}/${PREFIX} dev $INT_NAME
-sudo ip link set $INT_NAME up
+# 2. Crear interfaz interna OVS para Gateway
+GW_PORT="gw_vlan${VLAN_ID}"
+GW_IP=$(echo $CIDR | sed 's/\.0\/24/\.1\/24/')
 
-# 2. Configurar DHCP si esta habilitado
-if [ "$DHCP_ENABLE" -eq 1 ]; then
-    NS_NAME="dhcp_vlan${VLAN_ID}"
+if ! sudo ovs-vsctl list-ports br-int | grep -q "^${GW_PORT}$"; then
+    sudo ovs-vsctl add-port br-int $GW_PORT -- set Interface $GW_PORT type=internal tag=$VLAN_ID
+fi
+
+sudo ip addr flush dev $GW_PORT
+sudo ip addr add $GW_IP dev $GW_PORT
+sudo ip link set $GW_PORT up
+
+# 3. Configurar DHCP en Linux Network Namespace si está habilitado
+if [ "$DHCP_OPTION" == "habilitado" ]; then
+    NS_NAME="ns_dhcp_vlan${VLAN_ID}"
     VETH_OVS="veth_dhcp${VLAN_ID}"
     VETH_NS="veth_ns${VLAN_ID}"
-    DHCP_IP=$(echo $CIDR | cut -d'/' -f1 | awk -F. '{print $1"."$2"."$3"."$4+2}')
+    DHCP_IP=$(echo $CIDR | sed 's/\.0\/24/\.2\/24/')
+    GW_ONLY_IP=$(echo $GW_IP | cut -d'/' -f1)
 
-    # Crear Namespace y VETH pair
-    sudo ip netns add $NS_NAME
-    sudo ip link add $VETH_OVS type veth peer name $VETH_NS
-    sudo ovs-vsctl --may-exist add-port br-int $VETH_OVS tag=$VLAN_ID
-    sudo ip link set $VETH_OVS up
+    sudo ip netns add $NS_NAME 2>/dev/null || true
+    sudo ip link add $VETH_OVS type veth peer name $VETH_NS 2>/dev/null || true
 
-    # Mover la interfaz al Namespace y configurar IP
+    sudo ovs-vsctl add-port br-int $VETH_OVS tag=$VLAN_ID 2>/dev/null || true
     sudo ip link set $VETH_NS netns $NS_NAME
-    sudo ip netns exec $NS_NAME ip addr add ${DHCP_IP}/${PREFIX} dev $VETH_NS
+
+    sudo ip link set $VETH_OVS up
+    sudo ip netns exec $NS_NAME ip addr add $DHCP_IP dev $VETH_NS
     sudo ip netns exec $NS_NAME ip link set $VETH_NS up
     sudo ip netns exec $NS_NAME ip link set lo up
-    sudo ip netns exec $NS_NAME ip route add default via $GW_IP
 
-    # Levantar servicio Dnsmasq dentro del Namespace
+    # Iniciar dnsmasq dentro del namespace
     sudo ip netns exec $NS_NAME dnsmasq \
-      --interface=$VETH_NS \
-      --dhcp-range=${DHCP_START},${DHCP_END},255.255.255.0 \
-      --dhcp-option=3,${GW_IP} \
-      --dhcp-option=6,8.8.8.8
+        --interface=$VETH_NS \
+        --dhcp-range=$(echo $DHCP_RANGE | cut -d' ' -f1),$(echo $DHCP_RANGE | cut -d' ' -f2),255.255.255.0 \
+        --dhcp-option=3,$GW_ONLY_IP \
+        --dhcp-option=6,8.8.8.8
 fi
